@@ -12,6 +12,7 @@
 
 #define ENABLE_SOUND 0
 #include "peanut_gb.h"
+#include "boot_logo.h"
 
 // ---------- Screen pins ----------
 #define TFT_CS   10
@@ -41,10 +42,13 @@ enum AppState { STATE_MENU, STATE_PLAYING };
 AppState appState = STATE_MENU;
 
 // ---------- ROM browser state ----------
-#define MAX_ROMS 20
+#define MAX_ROMS 40
+#define VISIBLE_ROWS 9
 String romList[MAX_ROMS];
+String romTitles[MAX_ROMS];
 int romCount = 0;
 int selectedIndex = 0;
+int scrollOffset = 0;
 
 // ---------- Game Boy core state ----------
 struct gb_s gb;
@@ -82,6 +86,12 @@ void buildScaleTables() {
 // FPS instrumentation
 uint32_t frameCount = 0;
 uint32_t fpsWindowStart = 0;
+
+// ---------- Save game state ----------
+String currentSavePath = "";
+uint32_t currentSaveSize = 0;
+uint32_t lastAutosaveTime = 0;
+#define AUTOSAVE_INTERVAL_MS 30000
 
 // ---------- Debounce ----------
 uint32_t lastPressTime[40] = {0};
@@ -123,8 +133,61 @@ void lcd_draw_line(struct gb_s *gb_ptr, const uint8_t *pixels, const uint_fast8_
 }
 
 // ------------------------------------------------------------
+// Boot logo animation - mimics the classic scroll-down-then-
+// settle effect of the original Game Boy boot screen
+// ------------------------------------------------------------
+
+void playBootLogo() {
+  tft.fillScreen(0x0000);
+
+  int targetY = (128 - LOGO_H) / 2;
+  int startY = -LOGO_H;
+  int x = (128 - LOGO_W) / 2;
+
+  // Scroll the logo down from off-screen to its resting position
+  for (int y = startY; y <= targetY; y += 3) {
+    tft.fillScreen(0x0000);
+    tft.drawRGBBitmap(x, y, logo_bitmap, LOGO_W, LOGO_H);
+    delay(20);
+  }
+
+  // Hold on screen briefly, like the real boot sequence pause
+  delay(900);
+
+  tft.fillScreen(0x0000);
+}
+
+// ------------------------------------------------------------
 // ROM browser
 // ------------------------------------------------------------
+
+// Reads the game's real title straight from the ROM header (offset 0x134,
+// 16 bytes) without needing to load the whole ROM into memory
+String readRomTitle(const char *path) {
+  File f = SD.open(path);
+  if (!f) return String("");
+  if (f.size() < 0x144) {
+    f.close();
+    return String("");
+  }
+
+  f.seek(0x134);
+  char titleBuf[17];
+  int n = f.read((uint8_t *)titleBuf, 16);
+  f.close();
+
+  if (n <= 0) return String("");
+
+  String title = "";
+  for (int i = 0; i < n; i++) {
+    char c = titleBuf[i];
+    if (c == 0) break;
+    if (c < 32 || c > 126) break; // stop at non-printable bytes (e.g. CGB flag)
+    title += c;
+  }
+  title.trim();
+  return title;
+}
 
 void loadRomList() {
   romCount = 0;
@@ -141,7 +204,10 @@ void loadRomList() {
     String name = entry.name();
     if (!entry.isDirectory() && name.endsWith(".gb")) {
       if (romCount < MAX_ROMS) {
-        romList[romCount++] = name;
+        String path = "/" + name;
+        romList[romCount] = name;
+        romTitles[romCount] = readRomTitle(path.c_str());
+        romCount++;
       }
     }
     entry.close();
@@ -154,6 +220,12 @@ void loadRomList() {
 }
 
 void drawMenu() {
+  // Keep the selected item scrolled into view
+  if (selectedIndex < scrollOffset) scrollOffset = selectedIndex;
+  if (selectedIndex >= scrollOffset + VISIBLE_ROWS) {
+    scrollOffset = selectedIndex - VISIBLE_ROWS + 1;
+  }
+
   tft.fillScreen(0x0000);
   tft.setCursor(0, 0);
   tft.setTextColor(0xFFFF);
@@ -167,20 +239,68 @@ void drawMenu() {
     return;
   }
 
-  for (int i = 0; i < romCount; i++) {
-    tft.setCursor(0, 12 * (i + 1));
+  int endIndex = min(romCount, scrollOffset + VISIBLE_ROWS);
+  for (int i = scrollOffset; i < endIndex; i++) {
+    int row = i - scrollOffset;
+    tft.setCursor(0, 12 * (row + 1));
     if (i == selectedIndex) {
       tft.setTextColor(0x0000, 0xFFFF);
     } else {
       tft.setTextColor(0xFFFF, 0x0000);
     }
-    tft.println(romList[i]);
+
+    String label = romTitles[i].length() > 0 ? romTitles[i] : romList[i];
+    if (label.length() > 20) label = label.substring(0, 20);
+    tft.println(label);
   }
 }
 
 // ------------------------------------------------------------
 // ROM loading + emulator start/stop
 // ------------------------------------------------------------
+
+// ------------------------------------------------------------
+// Save game persistence - one .sav file per ROM, holding cart RAM
+// ------------------------------------------------------------
+
+String getSavePath(const String &filename) {
+  String base = filename;
+  int dot = base.lastIndexOf('.');
+  if (dot >= 0) base = base.substring(0, dot);
+  return "/" + base + ".sav";
+}
+
+void loadSaveFile(const String &path, uint32_t size) {
+  memset(cart_ram, 0, CART_RAM_SIZE);
+  if (size == 0) return;
+
+  File f = SD.open(path.c_str());
+  if (!f) {
+    Serial.println("No existing save file - starting fresh");
+    return;
+  }
+
+  uint32_t toRead = (uint32_t)f.size();
+  if (toRead > size) toRead = size;
+  f.read(cart_ram, toRead);
+  f.close();
+  Serial.println("Save file loaded");
+}
+
+void writeSaveFile(const String &path, uint32_t size) {
+  if (size == 0) return;
+
+  SD.remove(path.c_str()); // ensure a clean overwrite, not an append
+  File f = SD.open(path.c_str(), FILE_WRITE);
+  if (!f) {
+    Serial.println("Failed to open save file for writing");
+    return;
+  }
+
+  f.write(cart_ram, size);
+  f.close();
+  Serial.println("Save written");
+}
 
 bool loadRomFromSD(const char *path) {
   File f = SD.open(path);
@@ -252,11 +372,27 @@ void startGame(const String &filename) {
 
   gb_init_lcd(&gb, &lcd_draw_line);
 
+  // Determine how much cart RAM this game actually uses, then load
+  // its save file (if one exists) into that RAM
+  uint32_t saveSize = (uint32_t)gb_get_save_size(&gb);
+  if (saveSize > CART_RAM_SIZE) saveSize = CART_RAM_SIZE; // safety cap
+
+  currentSaveSize = saveSize;
+  currentSavePath = getSavePath(filename);
+  loadSaveFile(currentSavePath, currentSaveSize);
+  lastAutosaveTime = millis();
+
   tft.fillScreen(0x0000);
   appState = STATE_PLAYING;
 }
 
 void exitToMenu() {
+  if (currentSaveSize > 0 && currentSavePath.length() > 0) {
+    writeSaveFile(currentSavePath, currentSaveSize);
+  }
+  currentSaveSize = 0;
+  currentSavePath = "";
+
   if (rom_data) {
     free(rom_data);
     rom_data = nullptr;
@@ -333,6 +469,8 @@ void setup() {
     while (1) delay(1000);
   }
 
+  playBootLogo();
+
   loadRomList();
   drawMenu();
 }
@@ -363,6 +501,15 @@ void loop() {
     gb_run_frame(&gb);
     blitFrameToOLED();
     yield(); // let the watchdog/background tasks breathe between frames
+
+    // Autosave periodically so a crash/power loss doesn't lose progress
+    if (currentSaveSize > 0) {
+      uint32_t now2 = millis();
+      if (now2 - lastAutosaveTime > AUTOSAVE_INTERVAL_MS) {
+        writeSaveFile(currentSavePath, currentSaveSize);
+        lastAutosaveTime = now2;
+      }
+    }
 
     // FPS counter - prints actual achieved frame rate every ~2 seconds
     frameCount++;
